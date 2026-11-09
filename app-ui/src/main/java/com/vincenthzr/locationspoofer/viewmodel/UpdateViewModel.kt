@@ -42,10 +42,10 @@ class UpdateViewModel(private val context: Context) : ViewModel() {
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                fun fetchJson(url: String): String {
+                fun fetchJson(url: String, accept: String = "application/json"): String {
                     val request = Request.Builder()
                         .url(url)
-                        .header("Accept", "application/vnd.github+json")
+                        .header("Accept", accept)
                         .build()
                     return okHttpClient.newCall(request).execute().use { response ->
                         check(response.isSuccessful) { "Failed to fetch updates: ${response.code}" }
@@ -53,26 +53,41 @@ class UpdateViewModel(private val context: Context) : ViewModel() {
                     }
                 }
 
-                val latest = GithubUpdateSource.parseRelease(
-                    JSONObject(fetchJson("${GithubUpdateSource.API_URL}/latest")),
-                    isLatest = true
-                )
-                // 历史记录不可用时，仍保留已获取的最新稳定版和更新说明。
-                val history = try {
-                    val array = JSONArray(fetchJson(GithubUpdateSource.API_URL))
-                    (0 until array.length()).mapNotNull { index ->
-                        val obj = array.getJSONObject(index)
-                        if (obj.optBoolean("draft") || obj.optString("tag_name") == latest.versionName) null
-                        else GithubUpdateSource.parseRelease(obj)
+                val releaseList = try {
+                    val latest = GithubUpdateSource.parseRelease(
+                        JSONObject(fetchJson("${GithubUpdateSource.API_URL}/latest", "application/vnd.github+json")),
+                        isLatest = true
+                    )
+                    // 历史记录不可用时，仍保留已获取的最新稳定版和更新说明。
+                    val history = try {
+                        val array = JSONArray(fetchJson(GithubUpdateSource.API_URL, "application/vnd.github+json"))
+                        (0 until array.length()).mapNotNull { index ->
+                            val obj = array.getJSONObject(index)
+                            if (obj.optBoolean("draft") || obj.optString("tag_name") == latest.versionName) null
+                            else GithubUpdateSource.parseRelease(obj)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
                     }
+                    // Beta 开关仍按发布时间选择候选版本；稳定版始终以 /latest 为准。
+                    history.filter { it.isPrerelease && it.publishedAt > latest.publishedAt } +
+                        latest + history.filterNot { it.isPrerelease && it.publishedAt > latest.publishedAt }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    emptyList()
+                    val array = JSONArray(fetchJson(GithubUpdateSource.GITLAB_API_URL))
+                    if (array.length() > 0) {
+                        val latest = GithubUpdateSource.parseGitLabRelease(array.getJSONObject(0))
+                        val history = (1 until array.length()).map { index ->
+                            GithubUpdateSource.parseGitLabRelease(array.getJSONObject(index))
+                        }
+                        listOf(latest) + history
+                    } else {
+                        emptyList()
+                    }
                 }
-                // Beta 开关仍按发布时间选择候选版本；稳定版始终以 /latest 为准。
-                val releaseList = history.filter { it.isPrerelease && it.publishedAt > latest.publishedAt } +
-                    latest + history.filterNot { it.isPrerelease && it.publishedAt > latest.publishedAt }
 
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(isLoading = false, releases = releaseList) }
